@@ -1,0 +1,459 @@
+# Enhanced llm_worker.py with better parsing and Indian language support
+
+import sys
+import json
+import re
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+
+# Try to import advanced NLP libraries, fall back to basic parsing
+try:
+    import ollama
+    OLLAMA_AVAILABLE = True
+    MODEL_NAME = 'phi3'
+    client = ollama.Client(host='http://localhost:11434', timeout=60)
+except ImportError:
+    OLLAMA_AVAILABLE = False
+    print("[Info] Ollama not available, using rule-based parsing")
+
+# Enhanced system prompts for better understanding
+MASTER_SYSTEM_PROMPT = """
+You are an AI assistant specialized in helping Indian motor repair technicians track their business transactions. 
+You understand both English and common Hindi/regional language terms mixed in conversations.
+
+CRITICAL INSTRUCTIONS:
+1. Always respond with valid JSON containing "intent" and "payload" keys
+2. Be flexible with Indian English and mixed language inputs
+3. Understand common business terms used by technicians
+4. Use the conversation history to understand context, especially for updates
+
+INTENTS (choose exactly one):
+- 'transaction': New income/expense entry
+- 'update_transaction': Modify the most recent transaction (if user says 'actually', 'correction', etc.)
+- 'database_query': User wants to search/find information
+- 'delete_transactions': User wants to delete transactions (e.g., "delete todays data")
+- 'greeting': Hello/namaste type messages
+- 'question': General questions about capabilities
+- 'error': When you cannot understand
+
+TRANSACTION PARSING RULES:
+- Income keywords: earned, income, received, payment, got, mila, kamaya
+- Expense keywords: spent, expense, cost, bought, kharcha, lagaya  
+- Amount: Extract numbers (₹500, 500 rupees, five hundred, etc.)
+- Customer: Names or titles (Ram, Sharma ji, local factory, etc.)
+- Details: What work was done (motor repair, rewinding, bearing change, etc.)
+
+For 'update_transaction': Use the previous transaction from history and only change what's mentioned.
+
+SEARCH QUERY RULES:
+- Customer questions: "Ram ka paisa", "what did Sharma pay", "jobs for local factory" -> {"customer_name": "Ram"}
+- Amount questions: "how much earned", "total income", "expenses today" -> {"type": "income"}
+- Work questions: "motor repair jobs", "rewinding work", "bearing replacements" -> {"details_keyword": "motor repair"}
+- Date filters: Detect "today", "yesterday", "this week", "this month", "last month", etc. Add 'date_from' and 'date_to' in YYYY-MM-DD format. Current date is 2025-09-18.
+
+DELETE RULES:
+- Keywords: "delete", "remove", "clear", "erase", "today", "todays data" -> {"delete_scope": "today"}
+
+EXAMPLES:
+
+Input: "Income 1500 from Ram sahib for motor rewinding"
+Output: {"intent": "transaction", "payload": {"type": "income", "amount_paise": 150000, "customer": "Ram sahib", "details": "motor rewinding"}}
+
+Input: "Spent 200 on copper wire from market"  
+Output: {"intent": "transaction", "payload": {"type": "expense", "amount_paise": 20000, "customer": null, "details": "copper wire from market"}}
+
+Input: "How much did Ram pay me this month?"
+Output: {"intent": "database_query", "payload": {"customer_name": "Ram", "type": "income", "date_from": "2025-09-01", "date_to": "2025-09-30"}}
+
+Input: "Show me all motor repair jobs"
+Output: {"intent": "database_query", "payload": {"details_keyword": "motor repair"}}
+
+Input: "What is my total income today?"
+Output: {"intent": "database_query", "payload": {"type": "income", "date_from": "2025-09-18", "date_to": "2025-09-18"}}
+
+Input: "actually, it was 2000 rupees for bearing change"
+Output: {"intent": "update_transaction", "payload": {"amount_paise": 200000, "details": "bearing change"}}
+
+Input: "delete todays data"
+Output: {"intent": "delete_transactions", "payload": {"delete_scope": "today"}}
+
+Always extract amounts in paise (multiply rupees by 100).
+Handle variations like: "fifteen hundred", "1.5k", "₹1500", "1500 rs"
+"""
+
+ANSWER_PROMPT = """
+You are an AI assistant for technicians. Given the user's question and the filtered database results (list of [id, type, amount_paise, customer_name, details, timestamp]), formulate a natural, helpful answer in a concise format.
+
+Use rupees (amount_paise / 100).
+
+User question: {user_question}
+
+Database results: {db_results_json}
+
+Provide the answer directly, use emojis sparingly.
+"""
+
+# Rule-based fallback parser for when Ollama is not available
+class RuleBasedParser:
+    def __init__(self):
+        # Income indicators (English + Hindi/common terms)
+        self.income_keywords = [
+            'income', 'earned', 'received', 'payment', 'got', 'paid', 'charge',
+            'mila', 'kamaya', 'paisa aya', 'earning', 'bill', 'job done'
+        ]
+        
+        # Expense indicators
+        self.expense_keywords = [
+            'spent', 'expense', 'cost', 'bought', 'purchase', 'paid for',
+            'kharcha', 'lagaya', 'buy', 'shopping', 'material'
+        ]
+        
+        # Query indicators
+        self.query_keywords = [
+            'how much', 'show me', 'tell me', 'what did', 'total', 'history',
+            'kitna', 'dikhao', 'batao', 'kya', 'list', 'find'
+        ]
+        
+        # Delete indicators
+        self.delete_keywords = [
+            'delete', 'remove', 'clear', 'erase', 'hataye', 'hatao'
+        ]
+        
+        # Greeting patterns
+        self.greeting_keywords = [
+            'hello', 'hi', 'namaste', 'namaskar', 'good morning', 'good evening', 'hii'
+        ]
+        
+        # Update indicators
+        self.update_keywords = [
+            'actually', 'correction', 'change to', 'update', 'mistake', 'wrong', 'galat', 'badlo'
+        ]
+        
+        # Amount patterns (₹1500, 1500 rs, fifteen hundred, etc.)
+        self.amount_patterns = [
+            r'₹\s*(\d+(?:\.\d+)?)',           # ₹1500
+            r'(\d+(?:\.\d+)?)\s*(?:rs|rupees?|₹)',  # 1500 rs
+            r'(\d+(?:\.\d+)?)\s*(?:k|thousand)',    # 1.5k  
+            r'(\d+(?:\.\d+)?)',               # Plain numbers
+        ]
+        
+        # Text to number mappings
+        self.word_to_number = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10,
+            'eleven': 11, 'twelve': 12, 'fifteen': 15, 'twenty': 20,
+            'fifty': 50, 'hundred': 100, 'thousand': 1000,
+            'ek': 1, 'do': 2, 'teen': 3, 'char': 4, 'panch': 5,
+            'sau': 100, 'hazaar': 1000
+        }
+
+    def is_update(self, text_lower: str) -> bool:
+        return any(keyword in text_lower for keyword in self.update_keywords)
+
+    def is_delete(self, text_lower: str) -> bool:
+        return any(keyword in text_lower for keyword in self.delete_keywords) and 'today' in text_lower
+
+    def extract_date_filters(self, text_lower: str) -> Tuple[Optional[str], Optional[str]]:
+        today = datetime(2025, 9, 18).date()  # Current date as provided
+        
+        if 'today' in text_lower:
+            return today.isoformat(), today.isoformat()
+        
+        if 'yesterday' in text_lower:
+            yest = today - timedelta(days=1)
+            return yest.isoformat(), yest.isoformat()
+        
+        if 'this week' in text_lower:
+            start = today - timedelta(days=today.weekday())
+            return start.isoformat(), today.isoformat()
+        
+        if 'last week' in text_lower:
+            start = today - timedelta(days=today.weekday() + 7)
+            end = start + timedelta(days=6)
+            return start.isoformat(), end.isoformat()
+        
+        if 'this month' in text_lower:
+            start = today.replace(day=1)
+            return start.isoformat(), today.isoformat()
+        
+        if 'last month' in text_lower:
+            last_month_end = today.replace(day=1) - timedelta(days=1)
+            start = last_month_end.replace(day=1)
+            return start.isoformat(), last_month_end.isoformat()
+        
+        return None, None
+
+    def extract_amount_in_paise(self, text: str) -> Optional[int]:
+        text_lower = text.lower()
+        
+        for pattern in self.amount_patterns:
+            matches = re.findall(pattern, text_lower)
+            if matches:
+                try:
+                    amount = float(matches[0])
+                    
+                    if 'k' in text_lower or 'thousand' in text_lower or 'hazaar' in text_lower:
+                        amount *= 1000
+                    
+                    return int(amount * 100)
+                except (ValueError, IndexError):
+                    continue
+        
+        for word, number in self.word_to_number.items():
+            if word in text_lower:
+                multiplier = 1
+                if 'hundred' in text_lower or 'sau' in text_lower:
+                    multiplier *= 100
+                if 'thousand' in text_lower or 'hazaar' in text_lower:
+                    multiplier *= 1000
+                return int(number * multiplier * 100)
+        
+        return None
+
+    def extract_customer_name(self, text: str) -> Optional[str]:
+        customer_patterns = [
+            r'(?:from|by|for|customer)\s+([A-Za-z][A-Za-z\s]+?)(?:\s+(?:for|sahib|ji|bhai))?',
+            r'([A-Za-z][A-Za-z\s]+?)\s+(?:sahib|ji|bhai|sir|madam)',
+            r'([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)',
+        ]
+        
+        for pattern in customer_patterns:
+            matches = re.findall(pattern, text, re.IGNORECASE)
+            if matches:
+                customer = matches[0].strip()
+                exclude_words = ['motor', 'repair', 'work', 'job', 'income', 'expense', 'money']
+                if customer.lower() not in exclude_words and len(customer) > 1:
+                    return customer
+        
+        return None
+
+    def extract_details(self, text: str) -> Optional[str]:
+        work_keywords = [
+            'motor', 'rewinding', 'repair', 'bearing', 'replacement', 'service',
+            'maintenance', 'coil', 'winding', 'starter', 'capacitor', 'brush',
+            'commutator', 'armature', 'stator', 'rotor'
+        ]
+        
+        details_parts = []
+        words = text.lower().split()
+        
+        for i, word in enumerate(words):
+            if any(keyword in word for keyword in work_keywords):
+                start = max(0, i-1)
+                end = min(len(words), i+3)
+                detail_phrase = ' '.join(words[start:end])
+                details_parts.append(detail_phrase)
+        
+        if details_parts:
+            return ' '.join(set(details_parts))
+        
+        for_match = re.search(r'for\s+(.+?)(?:\s+from|\s+by|$)', text, re.IGNORECASE)
+        if for_match:
+            return for_match.group(1).strip()
+        
+        return None
+
+    def parse_command(self, text: str) -> Dict:
+        text = text.strip()
+        text_lower = text.lower()
+        
+        if any(greeting in text_lower for greeting in self.greeting_keywords):
+            return {'intent': 'greeting', 'payload': None}
+        
+        if self.is_delete(text_lower):
+            return {'intent': 'delete_transactions', 'payload': {'delete_scope': 'today'}}
+        
+        if any(query in text_lower for query in self.query_keywords):
+            payload = {}
+            
+            if any(word in text_lower for word in self.income_keywords):
+                payload['type'] = 'income'
+            elif any(word in text_lower for word in self.expense_keywords):
+                payload['type'] = 'expense'
+            
+            customer = self.extract_customer_name(text)
+            if customer:
+                payload['customer_name'] = customer
+            
+            details = self.extract_details(text)
+            if details:
+                payload['details_keyword'] = details
+            
+            date_from, date_to = self.extract_date_filters(text_lower)
+            if date_from:
+                payload['date_from'] = date_from
+                payload['date_to'] = date_to or date_from
+            
+            return {'intent': 'database_query', 'payload': payload if payload else None}
+        
+        if self.is_update(text_lower):
+            amount_paise = self.extract_amount_in_paise(text)
+            payload = {}
+            if amount_paise:
+                payload['amount_paise'] = amount_paise
+            customer = self.extract_customer_name(text)
+            if customer:
+                payload['customer'] = customer
+            details = self.extract_details(text)
+            if details:
+                payload['details'] = details
+            trans_type = 'income' if any(k in text_lower for k in self.income_keywords) else 'expense'
+            payload['type'] = trans_type
+            return {'intent': 'update_transaction', 'payload': payload}
+        
+        amount_paise = self.extract_amount_in_paise(text)
+        if amount_paise:
+            is_income = any(keyword in text_lower for keyword in self.income_keywords)
+            is_expense = any(keyword in text_lower for keyword in self.expense_keywords)
+            
+            if is_income or not is_expense:
+                transaction_type = 'income'
+            else:
+                transaction_type = 'expense'
+            
+            payload = {
+                'type': transaction_type,
+                'amount_paise': amount_paise,
+                'customer': self.extract_customer_name(text),
+                'details': self.extract_details(text)
+            }
+            
+            return {'intent': 'transaction', 'payload': payload}
+        
+        return {'intent': 'question', 'payload': None}
+
+# Initialize rule-based parser
+rule_parser = RuleBasedParser()
+
+def process_command_with_ollama(messages: List[Dict]) -> Dict:
+    """Process command using Ollama LLM"""
+    try:
+        messages_to_send = [{'role': 'system', 'content': MASTER_SYSTEM_PROMPT}] + messages
+        
+        response = client.chat(
+            model=MODEL_NAME,
+            messages=messages_to_send,
+            options={'temperature': 0.1, 'num_predict': 256},
+            format='json'
+        )
+        
+        result = json.loads(response['message']['content'])
+        
+        if 'intent' not in result:
+            raise ValueError("Missing 'intent' in response")
+        
+        return result
+        
+    except Exception as e:
+        print(f"[Ollama Error]: {e}")
+        if messages and messages[-1].get('role') == 'user':
+            return rule_parser.parse_command(messages[-1]['content'])
+        return {'intent': 'error', 'payload': str(e)}
+
+def process_command_rule_based(messages: List[Dict]) -> Dict:
+    """Process command using rule-based approach"""
+    if not messages or messages[-1].get('role') != 'user':
+        return {'intent': 'error', 'payload': 'No user message found'}
+    
+    user_message = messages[-1]['content']
+    return rule_parser.parse_command(user_message)
+
+def formulate_answer_from_data(user_question: str, db_results_json: str) -> str:
+    """Generate human-readable answer from database results"""
+    try:
+        db_results = json.loads(db_results_json)
+        
+        if not db_results:
+            return "I couldn't find any matching records in your transaction history."
+        
+        if OLLAMA_AVAILABLE:
+            prompt = ANSWER_PROMPT.format(user_question=user_question, db_results_json=db_results_json)
+            response = client.chat(
+                model=MODEL_NAME,
+                messages=[{'role': 'system', 'content': prompt}],
+                options={'temperature': 0.1, 'num_predict': 300}
+            )
+            return response['message']['content'].strip()
+        
+        else:
+            total_income = 0
+            total_expense = 0
+            customers = set()
+            recent_jobs = []
+            
+            for record in db_results:
+                trans_id, trans_type, amount_paise, customer_name, details, timestamp = record
+                amount_rupees = amount_paise / 100
+                
+                if trans_type == 'income':
+                    total_income += amount_rupees
+                elif trans_type == 'expense':
+                    total_expense += amount_rupees
+                
+                if customer_name:
+                    customers.add(customer_name)
+                
+                if len(recent_jobs) < 5:
+                    job_summary = f"ID {trans_id}: {trans_type.capitalize()} ₹{amount_rupees:.2f} - {details or 'No details'} ({timestamp})"
+                    if customer_name:
+                        job_summary += f" for {customer_name}"
+                    recent_jobs.append(job_summary)
+            
+            question_lower = user_question.lower()
+            
+            if 'how much' in question_lower:
+                if 'pay' in question_lower or 'earned' in question_lower or 'income' in question_lower:
+                    return f"💰 Total income from matching transactions: ₹{total_income:.2f}"
+                elif 'spent' in question_lower or 'expense' in question_lower:
+                    return f"💸 Total expenses from matching transactions: ₹{total_expense:.2f}"
+            
+            response = "🔍 Summary of matching transactions:\n"
+            response += f"💰 Income: ₹{total_income:.2f}\n"
+            response += f"💸 Expenses: ₹{total_expense:.2f}\n"
+            response += f"📈 Net: ₹{total_income - total_expense:.2f}\n"
+            if customers:
+                response += f"👥 Customers: {', '.join(customers)}\n"
+            if recent_jobs:
+                response += "\nDetails:\n" + "\n".join(recent_jobs)
+                if len(db_results) > 5:
+                    response += f"\n(and {len(db_results)-5} more)"
+            
+            return response
+    
+    except Exception as e:
+        return f"Error processing data: {str(e)}. Please try again."
+
+def main():
+    try:
+        input_data = json.loads(sys.stdin.read().strip())
+        task = input_data.get('task', 'parse_command')
+        history = input_data.get('history', [])
+        context = input_data.get('context', {})
+        
+        if task == 'parse_command':
+            if history and history[-1].get('role') == 'user':
+                if OLLAMA_AVAILABLE:
+                    result = process_command_with_ollama(history)
+                else:
+                    result = process_command_rule_based(history)
+            else:
+                result = {'intent': 'error', 'payload': 'No user message'}
+        
+        elif task == 'formulate_answer_from_data':
+            user_question = context.get('user_question', '')
+            db_results_json = context.get('db_results', '[]')
+            answer = formulate_answer_from_data(user_question, db_results_json)
+            result = {'intent': 'answer', 'payload': answer}
+        
+        else:
+            result = {'intent': 'error', 'payload': f'Unknown task: {task}'}
+        
+        print(json.dumps(result, ensure_ascii=False))
+    
+    except json.JSONDecodeError:
+        print(json.dumps({'intent': 'error', 'payload': 'Invalid JSON input'}))
+    except Exception as e:
+        print(json.dumps({'intent': 'error', 'payload': f'Unexpected error: {str(e)}'}))
+
+if __name__ == '__main__':
+    main()
